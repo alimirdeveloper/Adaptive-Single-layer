@@ -1,8 +1,6 @@
 import numpy as np
 import tensorflow as tf
 from src.lstm_model import build_lstm
-from src.asla_aggregation import asla_aggregate
-from src.personalized_lstm import select_best_lr
 from src.client_selection import select_clients
 from src.client_profile import estimate_energy_cost
 from src.privacy import add_dp_noise
@@ -38,71 +36,119 @@ def local_train(X, y, global_weights, lr):
 
 
 # =========================================================
-# ASLA / FEDAVG CORE TRAINING
+# ASLA CORE AGGREGATION (PAPER-STYLE)
+# =========================================================
+def asla_aggregate(weights_list, losses, energy_scores, sizes):
+
+    eps = 1e-8
+
+    sizes = np.array(sizes)
+    losses = np.array(losses)
+    energy_scores = np.array(energy_scores)
+
+    # -----------------------------
+    # NORMALIZED COMPONENTS
+    # -----------------------------
+    data_factor = sizes / (np.sum(sizes) + eps)
+
+    quality_factor = 1.0 / (losses + eps)
+    quality_factor = quality_factor / (np.sum(quality_factor) + eps)
+
+    energy_factor = 1.0 / (energy_scores + eps)
+    energy_factor = energy_factor / (np.sum(energy_factor) + eps)
+
+    # -----------------------------
+    # FINAL ASLA WEIGHT (CONTROLLED)
+    # -----------------------------
+    weights = (
+        0.5 * data_factor +
+        0.3 * quality_factor +
+        0.2 * energy_factor
+    )
+
+    weights = weights / (np.sum(weights) + eps)
+
+    # -----------------------------
+    # AGGREGATION
+    # -----------------------------
+    new_weights = []
+
+    for layer_weights in zip(*weights_list):
+
+        agg = None
+
+        for i in range(len(weights_list)):
+
+            if agg is None:
+                agg = weights[i] * layer_weights[i]
+            else:
+                agg += weights[i] * layer_weights[i]
+
+        new_weights.append(agg)
+
+    return new_weights
+
+
+# =========================================================
+# FEDERATED TRAINING (ASLA FINAL VERSION)
 # =========================================================
 def federated_training(client_data, client_lrs, rounds=5, client_fraction=0.7):
 
     global_model = build_lstm()
     global_weights = global_model.get_weights()
 
-    snapshots = []   # IMPORTANT for paper Table 3/4
+    snapshots = []
 
-    # =====================================================
-    # FEDERATED ROUNDS
-    # =====================================================
     for r in range(rounds):
 
+        selected_clients = select_clients(client_data, client_fraction)
+
         local_weights = []
-        client_metrics = []
+        losses = []
         energy_scores = []
         sizes = []
 
-        # -------------------------------------------------
-        # CLIENT SELECTION (ASLA FEATURE)
-        # -------------------------------------------------
-        selected_clients = select_clients(client_data, fraction=client_fraction)
+        # -----------------------------
+        # CLIENT DROP-OUT SIMULATION
+        # -----------------------------
+        if len(selected_clients) == 0:
+            continue
 
-        # -------------------------------------------------
-        # LOCAL TRAINING
-        # -------------------------------------------------
         for cid in selected_clients:
 
             X, y = client_data[cid]
 
             model = local_train(X, y, global_weights, client_lrs[cid])
 
-            # validation proxy (quality)
-            loss = np.log(model.evaluate(X, y, verbose=0) + 1e-8)
+            loss = model.evaluate(X, y, verbose=0)
 
-            # energy proxy
             energy = estimate_energy_cost(X)
 
-            # weights
             weights = get_weights(model)
 
-            # privacy layer (DP noise)
-            noisy_weights = add_dp_noise(weights)
+            # privacy noise (light, realistic)
+            noisy_weights = add_dp_noise(weights, noise_scale=0.005)
 
             local_weights.append(noisy_weights)
-            client_metrics.append(loss)
+            losses.append(loss)
             energy_scores.append(energy)
             sizes.append(len(X))
 
-        # -------------------------------------------------
+        # -----------------------------
         # ASLA AGGREGATION
-        # -------------------------------------------------
+        # -----------------------------
         global_weights = asla_aggregate(
             local_weights,
-            client_metrics,
+            losses,
             energy_scores,
             sizes
         )
 
         global_model.set_weights(global_weights)
 
-        # -------------------------------------------------
-        # SNAPSHOT (CRITICAL FOR PAPER TABLE 3/4)
-        # -------------------------------------------------
+        # -----------------------------
+        # SNAPSHOT (REAL PAPER STYLE)
+        # -----------------------------
         snapshots.append([w.copy() for w in global_weights])
 
     return global_model, snapshots

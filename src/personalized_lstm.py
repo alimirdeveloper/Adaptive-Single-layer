@@ -34,15 +34,22 @@ def select_best_lr(X_train, y_train, X_val, y_val):
     return best_model, best_lr, best_loss
 
 
-def split_client_data(X, y, clients, sample_clients=3):
+def split_client_data(X, y, clients, sample_clients=10):
 
-    unique = np.unique(clients)[:sample_clients]
+    unique = np.unique(clients)
+
+    # take up to 10 clients
+    unique = unique[:min(sample_clients, len(unique))]
+
     result = {}
 
     for c in unique:
 
         idx = clients == c
         Xc, yc = X[idx], y[idx]
+
+        if len(Xc) < 50:
+            continue  # avoid tiny clients (important for stability)
 
         split = int(len(Xc) * 0.8)
 
