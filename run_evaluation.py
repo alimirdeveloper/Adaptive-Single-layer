@@ -2,14 +2,14 @@ from src.load_pjm import run_pipeline
 from src.lstm_model import build_lstm
 from src.fedavg_personalized import federated_training
 from src.personalized_lstm import split_client_data, select_best_lr
-
+import numpy as np
 from src.paper_results_engine import (
     evaluate_global,
     client_mape_table,
     layerwise_table,
     print_paper_results
 )
-
+import matplotlib.pyplot as plt
 # =========================================================
 # 1. LOAD DATA
 # =========================================================
@@ -47,8 +47,10 @@ for cid, d in clients.items():
 # =========================================================
 # 4. FEDERATED TRAINING (ASLA / FEDAVG CORE)
 # =========================================================
-fed_model, snapshots = federated_training(client_data, client_lrs)
-
+fed_model, snapshots, contrib_log = federated_training(
+    client_data,
+    client_lrs
+)
 fed_metrics = evaluate_global(
     fed_model, X_test, y_test, "FedAvg/ASLA"
 )
@@ -81,3 +83,39 @@ print_paper_results(
     client_df,
     layer_df
 )
+
+clients = list(client_data.keys())
+
+if len(contrib_log) == 0:
+    raise ValueError("Contribution log is empty — check federated_training loop")
+
+final_contrib_raw = contrib_log[-1]
+
+# =====================================================
+# ALIGN CONTRIBUTIONS TO ALL CLIENTS
+# =====================================================
+client_index = {c: i for i, c in enumerate(clients)}
+
+final_contrib = np.zeros(len(clients))
+
+# selected clients only
+selected_clients = list(client_data.keys())[:len(final_contrib_raw)]
+
+for i, cid in enumerate(selected_clients):
+    final_contrib[client_index[cid]] = final_contrib_raw[i]
+
+# =====================================================
+# PLOT
+# =====================================================
+plt.figure(figsize=(10,5))
+
+plt.bar(clients, final_contrib)
+
+plt.title("ASLA Client Contribution (Final Round)")
+plt.ylabel("Contribution Weight")
+plt.xticks(rotation=45)
+
+plt.tight_layout()
+
+plt.savefig("outputs/figures/asla_client_contribution.png", dpi=300)
+plt.close()

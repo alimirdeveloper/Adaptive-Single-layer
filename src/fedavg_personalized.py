@@ -36,19 +36,19 @@ def local_train(X, y, global_weights, lr):
 
 
 # =========================================================
-# ASLA CORE AGGREGATION (PAPER-STYLE)
+# ASLA AGGREGATION
 # =========================================================
 def asla_aggregate(weights_list, losses, energy_scores, sizes):
 
     eps = 1e-8
 
-    sizes = np.array(sizes)
-    losses = np.array(losses)
-    energy_scores = np.array(energy_scores)
+    sizes = np.array(sizes, dtype=np.float32)
+    losses = np.array(losses, dtype=np.float32)
+    energy_scores = np.array(energy_scores, dtype=np.float32)
 
-    # -----------------------------
-    # NORMALIZED COMPONENTS
-    # -----------------------------
+    # -------------------------
+    # NORMALIZATION
+    # -------------------------
     data_factor = sizes / (np.sum(sizes) + eps)
 
     quality_factor = 1.0 / (losses + eps)
@@ -57,20 +57,20 @@ def asla_aggregate(weights_list, losses, energy_scores, sizes):
     energy_factor = 1.0 / (energy_scores + eps)
     energy_factor = energy_factor / (np.sum(energy_factor) + eps)
 
-    # -----------------------------
-    # FINAL ASLA WEIGHT (CONTROLLED)
-    # -----------------------------
-    weights = (
+    # -------------------------
+    # ASLA WEIGHTS
+    # -------------------------
+    client_weights = (
         0.5 * data_factor +
         0.3 * quality_factor +
         0.2 * energy_factor
     )
 
-    weights = weights / (np.sum(weights) + eps)
+    client_weights = client_weights / (np.sum(client_weights) + eps)
 
-    # -----------------------------
-    # AGGREGATION
-    # -----------------------------
+    # -------------------------
+    # FEDERATED AGGREGATION
+    # -------------------------
     new_weights = []
 
     for layer_weights in zip(*weights_list):
@@ -80,9 +80,9 @@ def asla_aggregate(weights_list, losses, energy_scores, sizes):
         for i in range(len(weights_list)):
 
             if agg is None:
-                agg = weights[i] * layer_weights[i]
+                agg = client_weights[i] * layer_weights[i]
             else:
-                agg += weights[i] * layer_weights[i]
+                agg += client_weights[i] * layer_weights[i]
 
         new_weights.append(agg)
 
@@ -90,7 +90,7 @@ def asla_aggregate(weights_list, losses, energy_scores, sizes):
 
 
 # =========================================================
-# FEDERATED TRAINING (ASLA FINAL VERSION)
+# FEDERATED TRAINING (ASLA - 10 CLIENT READY)
 # =========================================================
 def federated_training(client_data, client_lrs, rounds=5, client_fraction=0.7):
 
@@ -98,22 +98,32 @@ def federated_training(client_data, client_lrs, rounds=5, client_fraction=0.7):
     global_weights = global_model.get_weights()
 
     snapshots = []
+    contributions_log = []
+
+    client_ids = list(client_data.keys())
+    assert len(client_ids) > 0, "No clients found"
 
     for r in range(rounds):
 
+        # -------------------------
+        # CLIENT SELECTION
+        # -------------------------
         selected_clients = select_clients(client_data, client_fraction)
+
+        # IMPORTANT FIX: handle numpy arrays safely
+        if selected_clients is None or len(selected_clients) == 0:
+            selected_clients = client_ids
+        else:
+            selected_clients = list(selected_clients)
 
         local_weights = []
         losses = []
         energy_scores = []
         sizes = []
 
-        # -----------------------------
-        # CLIENT DROP-OUT SIMULATION
-        # -----------------------------
-        if len(selected_clients) == 0:
-            continue
-
+        # -------------------------
+        # LOCAL TRAINING
+        # -------------------------
         for cid in selected_clients:
 
             X, y = client_data[cid]
@@ -121,22 +131,25 @@ def federated_training(client_data, client_lrs, rounds=5, client_fraction=0.7):
             model = local_train(X, y, global_weights, client_lrs[cid])
 
             loss = model.evaluate(X, y, verbose=0)
-
             energy = estimate_energy_cost(X)
 
             weights = get_weights(model)
 
-            # privacy noise (light, realistic)
-            noisy_weights = add_dp_noise(weights, noise_scale=0.005)
+            # ASLA: update instead of raw weights
+            update = [w - gw for w, gw in zip(weights, global_weights)]
+
+            noisy_update = add_dp_noise(update, noise_scale=0.005)
+
+            noisy_weights = [gw + u for gw, u in zip(global_weights, noisy_update)]
 
             local_weights.append(noisy_weights)
             losses.append(loss)
             energy_scores.append(energy)
             sizes.append(len(X))
 
-        # -----------------------------
-        # ASLA AGGREGATION
-        # -----------------------------
+        # -------------------------
+        # AGGREGATION
+        # -------------------------
         global_weights = asla_aggregate(
             local_weights,
             losses,
@@ -146,9 +159,39 @@ def federated_training(client_data, client_lrs, rounds=5, client_fraction=0.7):
 
         global_model.set_weights(global_weights)
 
-        # -----------------------------
-        # SNAPSHOT (REAL PAPER STYLE)
-        # -----------------------------
         snapshots.append([w.copy() for w in global_weights])
 
-    return global_model, snapshots
+        # -------------------------
+        # CONTRIBUTION LOG (FIXED)
+        # -------------------------
+        sizes_np = np.array(sizes, dtype=np.float32)
+        losses_np = np.array(losses, dtype=np.float32)
+        energy_np = np.array(energy_scores, dtype=np.float32)
+
+        eps = 1e-8
+
+        data_factor = sizes_np / (np.sum(sizes_np) + eps)
+
+        quality_factor = 1.0 / (losses_np + eps)
+        quality_factor = quality_factor / (np.sum(quality_factor) + eps)
+
+        energy_factor = 1.0 / (energy_np + eps)
+        energy_factor = energy_factor / (np.sum(energy_factor) + eps)
+
+        contributions = (
+            0.5 * data_factor +
+            0.3 * quality_factor +
+            0.2 * energy_factor
+        )
+
+        contributions = contributions / (np.sum(contributions) + eps)
+
+        # IMPORTANT: store it per round
+        full_vector = np.zeros(len(client_ids))
+        for i, cid in enumerate(selected_clients):
+            idx = client_ids.index(cid)
+            full_vector[idx] = contributions[i]
+
+        contributions_log.append(full_vector)
+
+    return global_model, snapshots, contributions_log
