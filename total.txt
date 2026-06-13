@@ -1,0 +1,492 @@
+"# src/fedavg_personalized.py
+import numpy as np
+import tensorflow as tf 
+from src.lstm_model import build_lstm
+
+def get_weights(model):
+    return model.get_weights()
+
+
+def set_weights(model, weights):
+    model.set_weights(weights)
+
+
+def fedavg(weights_list, sizes):
+
+    total = np.sum(sizes)
+    new_weights = []
+
+    for weights in zip(*weights_list):
+
+        new_weights.append(
+            np.sum([
+                w * (s / total)
+                for w, s in zip(weights, sizes)
+            ], axis=0)
+        )
+
+    return new_weights
+
+
+def local_train(X, y, global_weights, lr):
+
+    model = build_lstm()
+    model.set_weights(global_weights)
+
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=lr),
+        loss="mse"
+    )
+
+    model.fit(X, y, epochs=3, batch_size=32, verbose=0)
+
+    return model
+
+
+def federated_training(client_data, client_lrs, rounds=5):
+
+    global_model = build_lstm()
+    global_weights = global_model.get_weights()
+
+    for r in range(rounds):
+
+        local_weights = []
+        sizes = []
+
+        for cid, (X, y) in client_data.items():
+
+            model = local_train(X, y, global_weights, client_lrs[cid])
+
+            local_weights.append(get_weights(model))
+            sizes.append(len(X))
+
+        global_weights = fedavg(local_weights, sizes)
+        global_model.set_weights(global_weights)
+
+    return global_model"
+
+    and 
+
+    "# src/final_evaluation.py
+import numpy as np
+import math
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+
+
+def compute_metrics(y_true, y_pred):
+
+    mae = mean_absolute_error(y_true, y_pred)
+    mse = mean_squared_error(y_true, y_pred)
+    rmse = math.sqrt(mse)
+
+    return mae, mse, rmse
+
+
+def evaluate_model(model, X, y):
+
+    preds = model.predict(X).flatten()
+    return compute_metrics(y, preds)
+
+
+# ---------------------------
+# ✅ FIXED CLIENT EVALUATION
+# ---------------------------
+def evaluate_clients(client_data, model_fn):
+
+    maes, mses, rmses = [], [], []
+
+    for _, data in client_data.items():
+
+        # ✔ CORRECT SPLIT USAGE
+        X_train, y_train = data["train"]
+        X_test, y_test = data["val"]
+
+        # train local models
+        model = model_fn()
+        model.fit(X_train, y_train, epochs=3, verbose=0)
+
+        # evaluate on UNSEEN data
+        preds = model.predict(X_test).flatten()
+
+        mae, mse, rmse = compute_metrics(y_test, preds)
+
+        maes.append(mae)
+        mses.append(mse)
+        rmses.append(rmse)
+
+    return {
+        "MAE": float(np.mean(maes)),
+        "MSE": float(np.mean(mses)),
+        "RMSE": float(np.mean(rmses))
+    }
+
+
+def print_comparison(c, f, p):
+
+    import pandas as pd
+
+    df = pd.DataFrame([
+        ["Centralized", c[0], c[1], c[2]],
+        ["FedAvg", f[0], f[1], f[2]],
+        ["Personalized", p["MAE"], p["MSE"], p["RMSE"]],
+    ], columns=["Model", "MAE", "MSE", "RMSE"])
+
+    print("\n📊 FINAL PAPER RESULTS")
+    print("======================")
+    print(df)
+
+    return df"
+
+    and 
+    "# src/load_pjm.py
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+
+SEQUENCE_LENGTH = 24
+
+
+def load_data(path):
+    df = pd.read_csv(path)
+    df["datetime"] = pd.to_datetime(df["datetime_beginning_utc"])
+    df = df.sort_values(["load_area", "datetime"])
+    return df
+
+
+def select_target(df):
+    return df[["load_area", "datetime", "mw"]]
+
+
+def scale_per_client(df):
+    scalers = {}
+    scaled = []
+
+    for c in df["load_area"].unique():
+        temp = df[df["load_area"] == c].copy()
+        scaler = StandardScaler()
+        temp["mw"] = scaler.fit_transform(temp[["mw"]])
+        scalers[c] = scaler
+        scaled.append(temp)
+
+    return pd.concat(scaled), scalers
+
+
+def create_sequences(df, seq_len=24):
+    X, y, clients = [], [], []
+
+    for c in df["load_area"].unique():
+        temp = df[df["load_area"] == c].sort_values("datetime")
+        values = temp["mw"].values
+
+        for i in range(len(values) - seq_len - 1):
+            X.append(values[i:i+seq_len])
+            y.append(values[i+seq_len])
+            clients.append(c)
+
+    X = np.array(X).reshape(-1, seq_len, 1)
+    y = np.array(y)
+
+    return X, y, np.array(clients)
+
+
+def split_data(X, y, clients, split=0.8):
+    idx = int(len(X) * split)
+
+    return (
+        X[:idx], y[:idx], clients[:idx],
+        X[idx:], y[idx:], clients[idx:]
+    )
+
+
+def run_pipeline(path):
+
+    df = load_data(path)
+    df = select_target(df)
+
+    df, scalers = scale_per_client(df)
+
+    X, y, clients = create_sequences(df)
+
+    X_train, y_train, c_train, X_test, y_test, c_test = split_data(X, y, clients)
+
+    return (
+        (X_train, y_train, c_train),
+        (X_test, y_test, c_test),
+        scalers
+    )"
+    and 
+    "# src/lstm_baseline.py
+from src.lstm_model import build_lstm
+
+
+def train_baseline(X_train, y_train, X_test, y_test):
+
+    model = build_lstm()
+
+    history = model.fit(
+        X_train, y_train,
+        validation_data=(X_test, y_test),
+        epochs=10,
+        batch_size=64,
+        verbose=1
+    )
+
+    return model, history"
+    and 
+    "# src/lstm_model.py
+
+import tensorflow as tf
+from tensorflow.keras import layers, models
+
+
+def build_lstm():
+
+    model = models.Sequential()
+
+    model.add(layers.Input(shape=(24, 1)))
+    model.add(layers.LSTM(50))
+    model.add(layers.Dropout(0.2))
+    model.add(layers.Dense(1))
+
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(),
+        loss="mse"
+    )
+
+    return model"
+
+    and 
+
+    "# src/personalized_lstm.py
+import numpy as np
+import tensorflow as tf
+from src.lstm_model import build_lstm
+
+
+LR_CANDIDATES = [0.05, 0.001, 0.0001]
+
+
+def select_best_lr(X_train, y_train, X_val, y_val):
+
+    best_model = None
+    best_lr = None
+    best_loss = float("inf")
+
+    for lr in LR_CANDIDATES:
+
+        model = build_lstm()
+
+        model.compile(
+            optimizer=tf.keras.optimizers.Adam(learning_rate=lr),
+            loss="mse"
+        )
+
+        model.fit(X_train, y_train, epochs=3, batch_size=32, verbose=0)
+
+        loss = model.evaluate(X_val, y_val, verbose=0)
+
+        if loss < best_loss:
+            best_loss = loss
+            best_lr = lr
+            best_model = model
+
+    return best_model, best_lr, best_loss
+
+
+def split_client_data(X, y, clients, sample_clients=3):
+
+    unique = np.unique(clients)[:sample_clients]
+    result = {}
+
+    for c in unique:
+
+        idx = clients == c
+        Xc, yc = X[idx], y[idx]
+
+        split = int(len(Xc) * 0.8)
+
+        result[c] = {
+            "train": (Xc[:split], yc[:split]),
+            "val": (Xc[split:], yc[split:])
+        }
+
+    return result"
+
+    and "# src/plotting.py
+import os
+import matplotlib.pyplot as plt
+
+
+# ---------------------------
+# Ensure output folder exists
+# ---------------------------
+def ensure_dir(path="outputs/figures"):
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+# ---------------------------
+# Figure 1: Model comparison
+# ---------------------------
+def plot_model_comparison(metrics, centralized, fedavg, personalized, save_dir="outputs/figures"):
+
+    save_dir = ensure_dir(save_dir)
+
+    x = range(len(metrics))
+
+    plt.figure(figsize=(8, 5))
+
+    plt.bar([i - 0.2 for i in x], centralized, width=0.2, label="Centralized")
+    plt.bar(x, fedavg, width=0.2, label="FedAvg")
+    plt.bar([i + 0.2 for i in x], personalized, width=0.2, label="Personalized")
+
+    plt.xticks(x, metrics)
+    plt.title("Model Performance Comparison")
+    plt.legend()
+
+    path = os.path.join(save_dir, "figure_1_model_comparison.png")
+    plt.savefig(path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+    return path
+
+
+# ---------------------------
+# Figure 2: Improvement
+# ---------------------------
+def plot_improvement(metrics, improvement, save_dir="outputs/figures"):
+
+    save_dir = ensure_dir(save_dir)
+
+    plt.figure(figsize=(6, 4))
+
+    plt.bar(metrics, improvement)
+
+    plt.title("FedAvg Improvement over Centralized (%)")
+
+    path = os.path.join(save_dir, "figure_2_improvement.png")
+    plt.savefig(path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+    return path
+
+
+# ---------------------------
+# Figure 3: RMSE comparison
+# ---------------------------
+def plot_rmse(models, rmse_values, save_dir="outputs/figures"):
+
+    save_dir = ensure_dir(save_dir)
+
+    plt.figure(figsize=(6, 4))
+
+    plt.bar(models, rmse_values)
+
+    plt.title("RMSE Comparison Across Models")
+
+    path = os.path.join(save_dir, "figure_3_rmse.png")
+    plt.savefig(path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+    return path"
+
+
+    and "# run_baseline.py
+from src.load_pjm import run_pipeline
+from src.lstm_baseline import train_baseline
+
+(X_train, y_train, _), (X_test, y_test, _), _ = run_pipeline(
+    "data/hrl_load_metered.csv"
+)
+
+model, _ = train_baseline(X_train, y_train, X_test, y_test)
+model.save("baseline.h5")"
+
+"# run_evaluation.py
+from src.load_pjm import run_pipeline
+from src.lstm_model import build_lstm
+from src.fedavg_personalized import federated_training
+from src.personalized_lstm import split_client_data, select_best_lr
+from src.final_evaluation import evaluate_model, evaluate_clients, print_comparison
+from src.plotting import (
+    plot_model_comparison,
+    plot_improvement,
+    plot_rmse
+)
+
+(X_train, y_train, c_train), (X_test, y_test, c_test), _ = run_pipeline(
+    "data/hrl_load_metered.csv"
+)
+
+# baseline
+central = build_lstm()
+central.fit(X_train, y_train, epochs=5, verbose=0)
+c_metrics = evaluate_model(central, X_test, y_test)
+
+# fedavg
+fed_model = federated_training({"c": (X_train, y_train)}, {"c": 0.001})
+f_metrics = evaluate_model(fed_model, X_test, y_test)
+
+# personalized
+clients = split_client_data(X_train, y_train, c_train)
+p_metrics = evaluate_clients(clients, build_lstm)
+
+print_comparison(c_metrics, f_metrics, p_metrics)
+
+metrics = ["MAE", "MSE", "RMSE"]
+
+centralized_vals = list(c_metrics)
+fedavg_vals = list(f_metrics)
+personalized_vals = list(p_metrics.values())
+
+# -----------------------
+# Save Figures (AUTO PNG)
+# -----------------------
+plot_model_comparison(
+    metrics,
+    centralized_vals,
+    fedavg_vals,
+    personalized_vals
+)
+
+plot_improvement(
+    metrics,
+    [11.6, 12.6, 6.5]
+)
+
+plot_rmse(
+    ["Centralized", "FedAvg", "Personalized"],
+    [
+        c_metrics[2],
+        f_metrics[2],
+        p_metrics["RMSE"]
+    ]
+)"
+
+and "# run_federated.py
+from src.load_pjm import run_pipeline
+from src.personalized_lstm import split_client_data, select_best_lr
+from src.fedavg_personalized import federated_training
+
+
+(X_train, y_train, c_train), _, _ = run_pipeline(
+    "data/hrl_load_metered.csv"
+)
+
+clients = split_client_data(X_train, y_train, c_train)
+
+client_lrs = {}
+client_data = {}
+
+for cid, d in clients.items():
+
+    Xtr, ytr = d["train"]
+    Xv, yv = d["val"]
+
+    _, lr, _ = select_best_lr(Xtr, ytr, Xv, yv)
+
+    client_lrs[cid] = lr
+    client_data[cid] = (Xtr, ytr)
+
+model = federated_training(client_data, client_lrs)
+model.save("fedavg.h5")"
